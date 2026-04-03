@@ -3,6 +3,7 @@ set -euo pipefail
 
 APP_NAME="github-raw-proxy"
 CLI_NAME="hscgp"
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 SRC_FILE="${SRC_FILE:-./github-raw-proxy.go}"
 INSTALL_DIR="/opt/${APP_NAME}"
 BIN_PATH="${INSTALL_DIR}/${APP_NAME}"
@@ -158,7 +159,7 @@ EOF
 
 install_cli_command() {
   local cli_path="/usr/local/bin/$CLI_NAME"
-  cp -f "$0" "$cli_path"
+  cp -f "$SCRIPT_PATH" "$cli_path"
   chmod 755 "$cli_path"
 }
 
