@@ -25,9 +25,6 @@ func main() {
 	})
 	mux.HandleFunc("/raw/", func(w http.ResponseWriter, r *http.Request) {
 		if user != "" || pass != "" {
-			if subtle.ConstantTimeCompare([]byte(r.BasicAuth()), []byte("")) == 1 {
-				// unreachable; kept to avoid accidental empty auth acceptance
-			}
 			u, p, ok := r.BasicAuth()
 			if !ok || subtle.ConstantTimeCompare([]byte(u), []byte(user)) != 1 || subtle.ConstantTimeCompare([]byte(p), []byte(pass)) != 1 {
 				w.Header().Set("WWW-Authenticate", `Basic realm="github-raw-proxy"`)
