@@ -159,6 +159,21 @@ EOF
 
 install_cli_command() {
   local cli_path="/usr/local/bin/$CLI_NAME"
+  local src_real dst_real
+
+  src_real="$(readlink -f "$SCRIPT_PATH" 2>/dev/null || printf '%s' "$SCRIPT_PATH")"
+  dst_real="$(readlink -f "$cli_path" 2>/dev/null || true)"
+
+  if [[ -n "$dst_real" && "$src_real" == "$dst_real" ]]; then
+    chmod 755 "$cli_path"
+    return 0
+  fi
+
+  if [[ -e "$cli_path" ]] && cmp -s "$SCRIPT_PATH" "$cli_path"; then
+    chmod 755 "$cli_path"
+    return 0
+  fi
+
   cp -f "$SCRIPT_PATH" "$cli_path"
   chmod 755 "$cli_path"
 }
