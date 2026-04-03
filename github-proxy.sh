@@ -2,6 +2,7 @@
 set -euo pipefail
 
 APP_NAME="github-raw-proxy"
+CLI_NAME="hscgp"
 SRC_FILE="${SRC_FILE:-./github-raw-proxy.go}"
 INSTALL_DIR="/opt/${APP_NAME}"
 BIN_PATH="${INSTALL_DIR}/${APP_NAME}"
@@ -12,9 +13,30 @@ GO_VERSION="${GO_VERSION:-1.24.2}"
 GO_BASE_URL="${GO_BASE_URL:-https://go.dev/dl}"
 ARCHIVE_NAME=""
 GO_BIN=""
+ACTION="install"
+NEW_USER=""
+NEW_PASS=""
 
 log() { printf '[%s] %s\n' "$APP_NAME" "$*"; }
 die() { printf '[%s] ERROR: %s\n' "$APP_NAME" "$*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+用法:
+  $CLI_NAME                 一键安装/重装
+  $CLI_NAME install         一键安装/重装
+  $CLI_NAME set-pass 密码   仅修改密码
+  $CLI_NAME set-auth 用户 密码  同时修改用户名和密码
+  使用 $CLI_NAME 进入设置
+
+环境变量:
+  SRC_FILE=/path/to/github-raw-proxy.go
+  PORT=9090
+  GO_VERSION=1.24.2
+  BASIC_AUTH_USER=admin
+  BASIC_AUTH_PASS=123456
+EOF
+}
 
 need_root() {
   [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "请用 root 运行"
@@ -63,9 +85,21 @@ install_go() {
   [[ -x "$GO_BIN" ]] || die "Go 安装失败"
 }
 
+load_existing_auth() {
+  [[ -f "$ENV_FILE" ]] || die "未找到配置文件：$ENV_FILE"
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  [[ -n "${BASIC_AUTH_USER:-}" ]] || die "配置文件中未找到用户名"
+  [[ -n "${BASIC_AUTH_PASS:-}" ]] || die "配置文件中未找到密码"
+}
+
 prompt_auth() {
   local default_user="admin"
   local input_user input_pass input_pass2
+
+  if [[ -n "${BASIC_AUTH_USER:-}" ]]; then
+    default_user="$BASIC_AUTH_USER"
+  fi
 
   read -r -p "请输入用户名 [${default_user}]: " input_user
   AUTH_USER="${input_user:-$default_user}"
@@ -122,6 +156,12 @@ WantedBy=multi-user.target
 EOF
 }
 
+install_cli_command() {
+  local cli_path="/usr/local/bin/$CLI_NAME"
+  cp -f "$0" "$cli_path"
+  chmod 755 "$cli_path"
+}
+
 restart_service() {
   systemctl daemon-reload
   systemctl enable --now "$APP_NAME"
@@ -131,6 +171,7 @@ restart_service() {
 show_result() {
   log "安装完成"
   log "Go：$GO_BIN"
+  log "命令：$CLI_NAME"
   log "用户名：$AUTH_USER"
   log "二进制：$BIN_PATH"
   log "配置：$ENV_FILE"
@@ -140,16 +181,102 @@ show_result() {
   log "本机测试：curl -u ${AUTH_USER}:*** http://127.0.0.1:$PORT/raw/{owner}/{repo}/{ref}/{path}"
 }
 
+change_password() {
+  local new_pass="$1"
+  load_existing_auth
+  AUTH_USER="$BASIC_AUTH_USER"
+  AUTH_PASS="$new_pass"
+  write_env_file
+  systemctl daemon-reload
+  systemctl restart "$APP_NAME"
+  log "密码已更新"
+  log "用户名：$AUTH_USER"
+  log "配置：$ENV_FILE"
+  log "重启：systemctl restart $APP_NAME"
+}
+
+change_auth() {
+  local new_user="$1"
+  local new_pass="$2"
+  [[ -n "$new_user" ]] || die "用户名不能为空"
+  [[ -n "$new_pass" ]] || die "密码不能为空"
+  AUTH_USER="$new_user"
+  AUTH_PASS="$new_pass"
+  write_env_file
+  systemctl daemon-reload
+  systemctl restart "$APP_NAME"
+  log "用户名和密码已更新"
+  log "用户名：$AUTH_USER"
+  log "配置：$ENV_FILE"
+  log "重启：systemctl restart $APP_NAME"
+}
+
 main() {
   need_root
-  check_source
-  ensure_deps
-  prompt_auth
-  install_and_build
-  write_env_file
-  write_service_file
-  restart_service
-  show_result
+
+  case "${1:-}" in
+    ""|install)
+      ACTION="install"
+      shift || true
+      ;;
+    set-pass|change-pass|passwd)
+      ACTION="set-pass"
+      shift || true
+      ;;
+    set-auth|change-auth)
+      ACTION="set-auth"
+      shift || true
+      ;;
+    -h|--help|help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "未知参数：$1"
+      ;;
+  esac
+
+  case "$ACTION" in
+    install)
+      check_source
+      ensure_deps
+      if [[ -n "${BASIC_AUTH_USER:-}" && -n "${BASIC_AUTH_PASS:-}" ]]; then
+        AUTH_USER="$BASIC_AUTH_USER"
+        AUTH_PASS="$BASIC_AUTH_PASS"
+      else
+        prompt_auth
+      fi
+      install_and_build
+      write_env_file
+      write_service_file
+      install_cli_command
+      restart_service
+      show_result
+      ;;
+    set-pass)
+      [[ -f "$ENV_FILE" ]] || die "未找到配置文件：$ENV_FILE"
+      NEW_PASS="${1:-${NEW_PASS:-${BASIC_AUTH_PASS:-}}}"
+      if [[ -z "$NEW_PASS" ]]; then
+        read -r -s -p "请输入新密码: " NEW_PASS
+        printf '\n'
+      fi
+      [[ -n "$NEW_PASS" ]] || die "密码不能为空"
+      change_password "$NEW_PASS"
+      ;;
+    set-auth)
+      [[ -f "$ENV_FILE" ]] || die "未找到配置文件：$ENV_FILE"
+      NEW_USER="${1:-${NEW_USER:-${BASIC_AUTH_USER:-}}}"
+      NEW_PASS="${2:-${NEW_PASS:-${BASIC_AUTH_PASS:-}}}"
+      if [[ -z "$NEW_USER" ]]; then
+        read -r -p "请输入新用户名: " NEW_USER
+      fi
+      if [[ -z "$NEW_PASS" ]]; then
+        read -r -s -p "请输入新密码: " NEW_PASS
+        printf '\n'
+      fi
+      change_auth "$NEW_USER" "$NEW_PASS"
+      ;;
+  esac
 }
 
 main "$@"
