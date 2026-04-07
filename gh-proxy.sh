@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# --- 配置参数 ---
+# --- 1. 配置参数 ---
 APP_NAME="gh-proxy"
 GH_REPO="huuzd/gh-proxy"
 INSTALL_DIR="/opt/github-proxy"
@@ -13,13 +13,14 @@ GO_LOCAL_DIR="${INSTALL_DIR}/go"
 SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
 PORT="9090"
 
-# --- 辅助函数 ---
+# --- 2. 辅助函数 ---
 log() { printf '[\033[32m%s\033[0m] %s\n' "$APP_NAME" "$*"; }
 die() { printf '[\033[31m%s\033[0m] ERROR: %s\n' "$APP_NAME" "$*" >&2; exit 1; }
 
-need_root() { [[ "$EUID" -ne 0 ]] && die "请使用 root 运行此脚本"; }
+need_root() { 
+    [[ "$EUID" -ne 0 ]] && die "请使用 root 权限运行此脚本"
+}
 
-# --- 初始化与安装 ---
 init_setup() {
     mkdir -p "$INSTALL_DIR"
     if [[ ! -f "$SRC_FILE" ]]; then
@@ -67,7 +68,7 @@ EOF
     log "服务已就绪！"
 }
 
-# --- 用户管理 ---
+# --- 3. 用户管理逻辑 ---
 add_user() {
     read -p "请输入新用户名: " username
     grep -q "^${username}:" "$USER_FILE" && { log "错误：用户已存在"; return; }
@@ -99,7 +100,7 @@ manage_users() {
     log "操作成功，服务已重启。"
 }
 
-# --- 功能菜单 ---
+# --- 4. 菜单与说明 ---
 show_help() {
     clear
     local ip=$(curl -s -m 5 https://api64.ipify.org || echo "你的服务器IP")
@@ -109,22 +110,17 @@ show_help() {
     echo -e "\033[32m1. 代理链接格式：\033[0m"
     echo -e "   http://\033[36m用户名\033[0m:\033[36m密码\033[0m@\033[35m${ip}\033[0m:${PORT}/raw/\033[33m{账号}/{仓库}/{分支}/{路径}\033[0m"
     echo ""
-    echo -e "\033[32m2. 转换示例：\033[0m"
-    echo -e "   原链接: https://raw.githubusercontent.com/huuzd/gh-proxy/main/gh-proxy.sh"
-    echo -e "   代理后: http://admin:123@${ip}:${PORT}/raw/huuzd/gh-proxy/main/gh-proxy.sh"
+    echo -e "\033[31m2. 安全建议：\033[0m"
+    echo -e "   建议使用 Nginx 对 \033[36mhttp://127.0.0.1:${PORT}\033[0m 进行反代并开启 HTTPS。"
     echo ""
-    echo -e "\033[31m3. 安全建议：\033[0m"
-    echo -e "   为保障安全，建议使用 Nginx 对 \033[36mhttp://127.0.0.1:${PORT}\033[0m 进行反代"
-    echo -e "   并开启 \033[32mHTTPS\033[0m 访问。"
-    echo ""
-    echo -e "\033[32m4. 快捷管理：\033[0m"
-    echo -e "   安装后，运行命令 \033[1;34m${APP_NAME}\033[0m 可再次打开管理菜单。"
+    echo -e "\033[32m3. 快捷管理：\033[0m"
+    echo -e "   安装后，直接运行命令 \033[1;34m${APP_NAME}\033[0m 即可打开此菜单。"
     echo -e "\033[33m====================================================\033[0m"
     read -n 1 -s -r -p "按回车键返回主菜单..."
 }
 
 uninstall() {
-    echo -e "\033[31m⚠️  确定要卸载程序并删除所有配置、用户数据吗？(y/N)\033[0m"
+    echo -e "\033[31m⚠️  确定要卸载程序并删除所有数据吗？(y/N)\033[0m"
     read -p "> " confirm
     [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
     systemctl stop "$APP_NAME" && systemctl disable "$APP_NAME"
@@ -134,39 +130,42 @@ uninstall() {
     exit 0
 }
 
-# --- 脚本执行入口 (修复后) ---
-need_root
-init_setup
+# --- 5. 核心启动入口 (！！！关键修复位置！！！) ---
+run_main() {
+    need_root
+    init_setup
+    
+    # 如果二进制文件不存在，说明没安装，强制跑一次安装流程
+    if [[ ! -f "$BIN_PATH" ]]; then
+        ensure_go
+        build_app
+    fi
 
-# 如果程序还没安装，强制运行安装流程
-if [[ ! -f "$BIN_PATH" ]] || [[ ! -d "$GO_LOCAL_DIR" ]]; then
-    log "检测到环境不完整，正在初始化安装..."
-    ensure_go
-    build_app
-    log "初始化完成！"
-    sleep 1
-fi
+    # 循环显示主菜单
+    while true; do
+        clear
+        echo "============================="
+        echo "    GH-PROXY 交互管理工具"
+        echo "============================="
+        echo " 1. 新建用户"
+        echo " 2. 用户管理 (修改/删除)"
+        echo " 3. 强制重新编译程序"
+        echo " 4. 查看使用说明 (Help)"
+        echo " 5. 卸载脚本"
+        echo " 0. 退出脚本"
+        echo "============================="
+        read -p "请输入选项 [0-5]: " choice
+        case $choice in
+            1) add_user ;;
+            2) manage_users ;;
+            3) ensure_go && build_app ;;
+            4) show_help ;;
+            5) uninstall ;;
+            0) exit 0 ;;
+            *) log "无效选项" ;;
+        esac
+    done
+}
 
-# 进入交互菜单
-while true; do
-    clear
-    echo "============================="
-    echo "    GH-PROXY 交互管理工具"
-    echo "============================="
-    echo " 1. 新建用户"
-    echo " 2. 用户管理 (修改/删除)"
-    echo " 3. 强制重新编译程序"
-    echo " 4. 查看使用说明 (Help)"
-    echo " 5. 卸载脚本"
-    echo " 0. 退出脚本"
-    echo "============================="
-    read -p "请输入选项 [0-5]: " choice
-    case $choice in
-        1) add_user ;;
-        2) manage_users ;;
-        3) ensure_go && build_app ;;
-        4) show_help ;;
-        5) uninstall ;;
-        0) exit 0 ;;
-    esac
-done
+# --- 6. 真正触发脚本执行 ---
+run_main
