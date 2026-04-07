@@ -24,7 +24,9 @@ init_setup() {
         log "正在同步远程源码..."
         wget -qO "$SRC_FILE" "https://raw.githubusercontent.com/${GH_REPO}/main/gh-proxy.go" || die "无法获取源码，请检查网络"
     fi
-    [[ ! -f "$ENV_FILE" ]] && echo "PORT=$PORT" > "$ENV_FILE"
+    if [[ ! -f "$ENV_FILE" ]]; then
+        echo "PORT=$PORT" > "$ENV_FILE"
+    fi
     touch "$USER_FILE"
 }
 
@@ -67,29 +69,48 @@ EOF
 
 add_user() {
     read -p "请输入新用户名: " username
-    grep -q "^${username}:" "$USER_FILE" && { log "错误：用户已存在"; return; }
+    if grep -q "^${username}:" "$USER_FILE" 2>/dev/null; then
+        log "错误：用户已存在"
+        return
+    fi
     read -s -p "请输入密码: " pass; echo
     read -s -p "请确认密码: " pass2; echo
-    [[ "$pass" == "$pass2" ]] && { echo "${username}:${pass}" >> "$USER_FILE"; log "用户添加成功"; } || log "两次密码输入不一致"
-    systemctl restart "$APP_NAME"
+    if [[ "$pass" == "$pass2" ]]; then
+        echo "${username}:${pass}" >> "$USER_FILE"
+        log "用户添加成功"
+        systemctl restart "$APP_NAME"
+    else
+        log "两次密码输入不一致"
+    fi
 }
 
 manage_users() {
+    if [[ ! -s "$USER_FILE" ]]; then
+        log "当前暂无用户"
+        return
+    fi
     local users=($(awk -F: '{print $1}' "$USER_FILE"))
-    [[ ${#users[@]} -eq 0 ]] && { log "当前暂无用户"; return; }
     echo "--- 当前用户列表 ---"
     for i in "${!users[@]}"; do echo "$((i+1)). ${users[$i]}"; done
     read -p "请选择用户编号 (输入0返回): " idx
-    [[ "$idx" == "0" ]] && return
+    [[ "$idx" == "0" || -z "$idx" ]] && return
     local target_user="${users[$((idx-1))]:-}"
     [[ -z "$target_user" ]] && return
     
     echo "1. 修改用户名  2. 修改密码  3. 删除用户  0. 返回"
     read -p "选择操作: " opt
     case $opt in
-        1) read -p "新用户名: " n; sed -i "s/^${target_user}:/${n}:/" "$USER_FILE" ;;
-        2) read -s -p "新密码: " p; echo; sed -i "s/^${target_user}:.*/${target_user}:${p}/" "$USER_FILE" ;;
-        3) sed -i "/^${target_user}:/d" "$USER_FILE" ;;
+        1)
+            read -p "新用户名: " n
+            sed -i "s/^${target_user}:/${n}:/" "$USER_FILE"
+            ;;
+        2)
+            read -s -p "新密码: " p; echo
+            sed -i "s/^${target_user}:.*/${target_user}:${p}/" "$USER_FILE"
+            ;;
+        3)
+            sed -i "/^${target_user}:/d" "$USER_FILE"
+            ;;
         *) return ;;
     esac
     systemctl restart "$APP_NAME"
@@ -98,7 +119,8 @@ manage_users() {
 
 show_help() {
     clear
-    local ip=$(curl -s -m 5 https://api64.ipify.org || echo "你的服务器IP")
+    local ip
+    ip=$(curl -s -m 5 https://api64.ipify.org || echo "你的服务器IP")
     echo "===================================================="
     echo "           GH-PROXY 使用指南"
     echo "===================================================="
@@ -126,10 +148,10 @@ uninstall() {
     exit 0
 }
 
-# --- 4. 脚本执行引擎 (核心：不在函数内的直接调用) ---
+# --- 4. 脚本执行引擎 ---
 
 # 检查 Root 权限
-if [[ "$EUID" -ne 0 ]]; then
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     die "请使用 root 权限运行此脚本"
 fi
 
@@ -156,13 +178,13 @@ while true; do
     echo " 0. 退出脚本"
     echo "============================="
     read -p "请输入选项 [0-5]: " choice
-    case $choice in
+    case "${choice:-}" in
         1) add_user ;;
         2) manage_users ;;
         3) ensure_go && build_app ;;
         4) show_help ;;
         5) uninstall ;;
         0) exit 0 ;;
-        *) log "无效选项" ;;
+        *) sleep 1 ;;
     esac
 done
