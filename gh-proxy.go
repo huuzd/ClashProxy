@@ -23,7 +23,6 @@ var proxyClient = &http.Client{
 	},
 }
 
-// 实时校验用户数据库
 func checkAuth(user, pass string) bool {
 	f, err := os.Open(".users")
 	if err != nil { return false }
@@ -46,7 +45,6 @@ func main() {
 	if port == "" { port = "9090" }
 
 	http.HandleFunc("/raw/", func(w http.ResponseWriter, r *http.Request) {
-		// 1. 身份校验
 		u, p, ok := r.BasicAuth()
 		if !ok || !checkAuth(u, p) {
 			w.Header().Set("WWW-Authenticate", `Basic realm="gh-proxy"`)
@@ -54,7 +52,6 @@ func main() {
 			return
 		}
 
-		// 2. 路径解析与容错
 		cleanPath := path.Clean(r.URL.Path)
 		trimmed := strings.TrimPrefix(cleanPath, "/raw")
 		parts := strings.Split(strings.Trim(trimmed, "/"), "/")
@@ -63,7 +60,6 @@ func main() {
 			return
 		}
 
-		// 3. 构建目标 GitHub URL
 		upstream := &url.URL{
 			Scheme: "https",
 			Host:   "raw.githubusercontent.com",
@@ -75,25 +71,22 @@ func main() {
 		defer cancel()
 
 		req, _ := http.NewRequestWithContext(ctx, r.Method, upstream.String(), nil)
-		req.Header.Set("User-Agent", "Mozilla/5.0 (GH-Proxy/2.0; 自建加速服务)")
+		req.Header.Set("User-Agent", "Mozilla/5.0 (GH-Proxy/2.0)")
 
-		// 4. 执行转发
 		resp, err := proxyClient.Do(req)
 		if err != nil {
-			log.Printf("转发失败: %v", err)
 			http.Error(w, "Proxy Error", http.StatusBadGateway)
 			return
 		}
 		defer resp.Body.Close()
 
-		// 5. 响应输出
 		for k, vv := range resp.Header {
 			for _, v := range vv { w.Header().Add(k, v) }
 		}
 		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
+		io.Copy(w, resp.Body)
 	})
 
-	log.Printf("GitHub Proxy 已在端口 %s 启动", port)
+	log.Printf("Proxy Service running on :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
