@@ -17,10 +17,7 @@ PORT="9090"
 log() { printf '[\033[32m%s\033[0m] %s\n' "$APP_NAME" "$*"; }
 die() { printf '[\033[31m%s\033[0m] ERROR: %s\n' "$APP_NAME" "$*" >&2; exit 1; }
 
-need_root() { 
-    [[ "$EUID" -ne 0 ]] && die "请使用 root 权限运行此脚本"
-}
-
+# --- 3. 核心逻辑函数 ---
 init_setup() {
     mkdir -p "$INSTALL_DIR"
     if [[ ! -f "$SRC_FILE" ]]; then
@@ -65,10 +62,9 @@ EOF
     systemctl daemon-reload
     systemctl enable --now "$APP_NAME"
     ln -sf "$INSTALL_DIR/$APP_NAME.sh" "/usr/local/bin/$APP_NAME"
-    log "服务已就绪！"
+    log "服务安装/更新成功！"
 }
 
-# --- 3. 用户管理逻辑 ---
 add_user() {
     read -p "请输入新用户名: " username
     grep -q "^${username}:" "$USER_FILE" && { log "错误：用户已存在"; return; }
@@ -100,72 +96,73 @@ manage_users() {
     log "操作成功，服务已重启。"
 }
 
-# --- 4. 菜单与说明 ---
 show_help() {
     clear
     local ip=$(curl -s -m 5 https://api64.ipify.org || echo "你的服务器IP")
-    echo -e "\033[33m====================================================\033[0m"
-    echo -e "\033[1m           GitHub Raw Proxy 使用指南\033[0m"
-    echo -e "\033[33m====================================================\033[0m"
-    echo -e "\033[32m1. 代理链接格式：\033[0m"
-    echo -e "   http://\033[36m用户名\033[0m:\033[36m密码\033[0m@\033[35m${ip}\033[0m:${PORT}/raw/\033[33m{账号}/{仓库}/{分支}/{路径}\033[0m"
+    echo "===================================================="
+    echo "           GH-PROXY 使用指南"
+    echo "===================================================="
+    echo "1. 代理链接格式："
+    echo "   http://用户名:密码@${ip}:${PORT}/raw/owner/repo/branch/path"
     echo ""
-    echo -e "\033[31m2. 安全建议：\033[0m"
-    echo -e "   建议使用 Nginx 对 \033[36mhttp://127.0.0.1:${PORT}\033[0m 进行反代并开启 HTTPS。"
+    echo "2. 安全建议："
+    echo "   建议使用 Nginx 对 http://127.0.0.1:${PORT} 进行反向代理并开启 HTTPS。"
     echo ""
-    echo -e "\033[32m3. 快捷管理：\033[0m"
-    echo -e "   安装后，直接运行命令 \033[1;34m${APP_NAME}\033[0m 即可打开此菜单。"
-    echo -e "\033[33m====================================================\033[0m"
+    echo "3. 快捷管理："
+    echo "   安装后，直接运行命令 ${APP_NAME} 即可打开此菜单。"
+    echo "===================================================="
     read -n 1 -s -r -p "按回车键返回主菜单..."
 }
 
 uninstall() {
-    echo -e "\033[31m⚠️  确定要卸载程序并删除所有数据吗？(y/N)\033[0m"
+    echo -e "\033[31m确定要卸载程序并删除所有数据吗？(y/N)\033[0m"
     read -p "> " confirm
     [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
-    systemctl stop "$APP_NAME" && systemctl disable "$APP_NAME"
+    systemctl stop "$APP_NAME" || true
+    systemctl disable "$APP_NAME" || true
     rm -f "$SERVICE_FILE" "/usr/local/bin/$APP_NAME"
     rm -rf "$INSTALL_DIR"
     log "卸载完成。"
     exit 0
 }
 
-# --- 5. 核心启动入口 (！！！关键修复位置！！！) ---
-run_main() {
-    need_root
-    init_setup
-    
-    # 如果二进制文件不存在，说明没安装，强制跑一次安装流程
-    if [[ ! -f "$BIN_PATH" ]]; then
-        ensure_go
-        build_app
-    fi
+# --- 4. 脚本执行引擎 (核心：不在函数内的直接调用) ---
 
-    # 循环显示主菜单
-    while true; do
-        clear
-        echo "============================="
-        echo "    GH-PROXY 交互管理工具"
-        echo "============================="
-        echo " 1. 新建用户"
-        echo " 2. 用户管理 (修改/删除)"
-        echo " 3. 强制重新编译程序"
-        echo " 4. 查看使用说明 (Help)"
-        echo " 5. 卸载脚本"
-        echo " 0. 退出脚本"
-        echo "============================="
-        read -p "请输入选项 [0-5]: " choice
-        case $choice in
-            1) add_user ;;
-            2) manage_users ;;
-            3) ensure_go && build_app ;;
-            4) show_help ;;
-            5) uninstall ;;
-            0) exit 0 ;;
-            *) log "无效选项" ;;
-        esac
-    done
-}
+# 检查 Root 权限
+if [[ "$EUID" -ne 0 ]]; then
+    die "请使用 root 权限运行此脚本"
+fi
 
-# --- 6. 真正触发脚本执行 ---
-run_main
+# 初始化目录环境
+init_setup
+
+# 如果主程序文件不存在，则强制执行安装流程
+if [[ ! -f "$BIN_PATH" ]]; then
+    ensure_go
+    build_app
+fi
+
+# 进入无限循环主菜单
+while true; do
+    clear
+    echo "============================="
+    echo "    GH-PROXY 交互管理工具"
+    echo "============================="
+    echo " 1. 新建用户"
+    echo " 2. 用户管理 (修改/删除)"
+    echo " 3. 强制重新编译程序"
+    echo " 4. 查看使用说明 (Help)"
+    echo " 5. 卸载脚本"
+    echo " 0. 退出脚本"
+    echo "============================="
+    read -p "请输入选项 [0-5]: " choice
+    case $choice in
+        1) add_user ;;
+        2) manage_users ;;
+        3) ensure_go && build_app ;;
+        4) show_help ;;
+        5) uninstall ;;
+        0) exit 0 ;;
+        *) log "无效选项" ;;
+    esac
+done
