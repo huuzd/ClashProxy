@@ -19,7 +19,7 @@ die() { printf '[\033[31m%s\033[0m] ERROR: %s\n' "$APP_NAME" "$*" >&2; exit 1; }
 
 need_root() { [[ "$EUID" -ne 0 ]] && die "请使用 root 运行此脚本"; }
 
-# --- 安装与环境检查 ---
+# --- 初始化与安装 ---
 init_setup() {
     mkdir -p "$INSTALL_DIR"
     if [[ ! -f "$SRC_FILE" ]]; then
@@ -134,18 +134,20 @@ uninstall() {
     exit 0
 }
 
-# --- 主循环 ---
+# --- 脚本执行入口 (修复后) ---
 need_root
 init_setup
 
-# 核心检测：如果二进制文件或环境缺失，强制执行安装
+# 如果程序还没安装，强制运行安装流程
 if [[ ! -f "$BIN_PATH" ]] || [[ ! -d "$GO_LOCAL_DIR" ]]; then
     log "检测到环境不完整，正在初始化安装..."
     ensure_go
     build_app
+    log "初始化完成！"
     sleep 1
 fi
 
+# 进入交互菜单
 while true; do
     clear
     echo "============================="
