@@ -13,14 +13,18 @@ GO_LOCAL_DIR="${INSTALL_DIR}/go"
 SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
 PORT="9090"
 
+# --- 辅助函数 ---
 log() { printf '[\033[32m%s\033[0m] %s\n' "$APP_NAME" "$*"; }
 die() { printf '[\033[31m%s\033[0m] ERROR: %s\n' "$APP_NAME" "$*" >&2; exit 1; }
 
+need_root() { [[ "$EUID" -ne 0 ]] && die "请使用 root 运行此脚本"; }
+
+# --- 安装与环境检查 ---
 init_setup() {
     mkdir -p "$INSTALL_DIR"
     if [[ ! -f "$SRC_FILE" ]]; then
         log "正在同步远程源码..."
-        wget -qO "$SRC_FILE" "https://raw.githubusercontent.com/${GH_REPO}/main/gh-proxy.go" || die "无法获取源码"
+        wget -qO "$SRC_FILE" "https://raw.githubusercontent.com/${GH_REPO}/main/gh-proxy.go" || die "无法获取源码，请检查网络"
     fi
     [[ ! -f "$ENV_FILE" ]] && echo "PORT=$PORT" > "$ENV_FILE"
     touch "$USER_FILE"
@@ -28,7 +32,7 @@ init_setup() {
 
 ensure_go() {
     if [[ ! -x "${GO_LOCAL_DIR}/bin/go" ]]; then
-        log "下载私有编译环境..."
+        log "下载私有编译环境 (Go 1.22.5)..."
         local arch="amd64"
         [[ "$(uname -m)" == "aarch64" ]] && arch="arm64"
         wget -qO /tmp/go.tar.gz "https://go.dev/dl/go1.22.5.linux-${arch}.tar.gz"
@@ -38,30 +42,67 @@ ensure_go() {
 }
 
 build_app() {
-    log "正在编译并配置系统服务..."
+    log "开始编译程序并配置系统服务..."
     "${GO_LOCAL_DIR}/bin/go" build -trimpath -ldflags='-s -w' -o "$BIN_PATH" "$SRC_FILE"
     chmod +x "$BIN_PATH"
+    
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=GitHub Proxy Service
 After=network.target
+
 [Service]
+Type=simple
 WorkingDirectory=$INSTALL_DIR
 EnvironmentFile=$ENV_FILE
 ExecStart=$BIN_PATH
 Restart=always
+
 [Install]
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable --now "$APP_NAME"
     ln -sf "$INSTALL_DIR/$APP_NAME.sh" "/usr/local/bin/$APP_NAME"
-    log "部署成功！"
+    log "服务已就绪！"
 }
 
+# --- 用户管理 ---
+add_user() {
+    read -p "请输入新用户名: " username
+    grep -q "^${username}:" "$USER_FILE" && { log "错误：用户已存在"; return; }
+    read -s -p "请输入密码: " pass; echo
+    read -s -p "请确认密码: " pass2; echo
+    [[ "$pass" == "$pass2" ]] && { echo "${username}:${pass}" >> "$USER_FILE"; log "用户添加成功"; } || log "两次密码输入不一致"
+    systemctl restart "$APP_NAME"
+}
+
+manage_users() {
+    local users=($(awk -F: '{print $1}' "$USER_FILE"))
+    [[ ${#users[@]} -eq 0 ]] && { log "当前暂无用户"; return; }
+    echo "--- 当前用户列表 ---"
+    for i in "${!users[@]}"; do echo "$((i+1)). ${users[$i]}"; done
+    read -p "请选择用户编号 (输入0返回): " idx
+    [[ "$idx" == "0" ]] && return
+    local target_user="${users[$((idx-1))]:-}"
+    [[ -z "$target_user" ]] && return
+    
+    echo "1. 修改用户名  2. 修改密码  3. 删除用户  0. 返回"
+    read -p "选择操作: " opt
+    case $opt in
+        1) read -p "新用户名: " n; sed -i "s/^${target_user}:/${n}:/" "$USER_FILE" ;;
+        2) read -s -p "新密码: " p; echo; sed -i "s/^${target_user}:.*/${target_user}:${p}/" "$USER_FILE" ;;
+        3) sed -i "/^${target_user}:/d" "$USER_FILE" ;;
+        *) return ;;
+    esac
+    systemctl restart "$APP_NAME"
+    log "操作成功，服务已重启。"
+}
+
+# --- 功能菜单 ---
 show_help() {
     clear
-    local ip=$(curl -s -m 5 https://api64.ipify.org || echo "YOUR_IP")
+    local ip=$(curl -s -m 5 https://api64.ipify.org || echo "你的服务器IP")
     echo -e "\033[33m====================================================\033[0m"
     echo -e "\033[1m           GitHub Raw Proxy 使用指南\033[0m"
     echo -e "\033[33m====================================================\033[0m"
@@ -69,36 +110,55 @@ show_help() {
     echo -e "   http://\033[36m用户名\033[0m:\033[36m密码\033[0m@\033[35m${ip}\033[0m:${PORT}/raw/\033[33m{账号}/{仓库}/{分支}/{路径}\033[0m"
     echo ""
     echo -e "\033[32m2. 转换示例：\033[0m"
-    echo -e "   原: https://raw.githubusercontent.com/huuzd/gh-proxy/main/gh-proxy.sh"
-    echo -e "   现: http://admin:123@${ip}:${PORT}/raw/huuzd/gh-proxy/main/gh-proxy.sh"
+    echo -e "   原链接: https://raw.githubusercontent.com/huuzd/gh-proxy/main/gh-proxy.sh"
+    echo -e "   代理后: http://admin:123@${ip}:${PORT}/raw/huuzd/gh-proxy/main/gh-proxy.sh"
     echo ""
     echo -e "\033[31m3. 安全建议：\033[0m"
-    echo -e "   为保障账号密码安全，强烈建议使用 Nginx/Caddy 对 \033[36mhttp://127.0.0.1:${PORT}\033[0m"
-    echo -e "   进行反向代理并开启 \033[32mHTTPS\033[0m 访问。"
+    echo -e "   为保障安全，建议使用 Nginx 对 \033[36mhttp://127.0.0.1:${PORT}\033[0m 进行反代"
+    echo -e "   并开启 \033[32mHTTPS\033[0m 访问。"
     echo ""
     echo -e "\033[32m4. 快捷管理：\033[0m"
-    echo -e "   安装后，在终端任何位置输入 \033[1;34mgh-proxy\033[0m 即可再次打开此菜单。"
+    echo -e "   安装后，运行命令 \033[1;34m${APP_NAME}\033[0m 可再次打开管理菜单。"
     echo -e "\033[33m====================================================\033[0m"
-    read -p "按回车返回菜单..."
+    read -n 1 -s -r -p "按回车键返回主菜单..."
 }
 
-# --- 用户管理 & 菜单逻辑 (略，保持之前版本一致) ---
-# ... (add_user, manage_users, uninstall 函数) ...
+uninstall() {
+    echo -e "\033[31m⚠️  确定要卸载程序并删除所有配置、用户数据吗？(y/N)\033[0m"
+    read -p "> " confirm
+    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
+    systemctl stop "$APP_NAME" && systemctl disable "$APP_NAME"
+    rm -f "$SERVICE_FILE" "/usr/local/bin/$APP_NAME"
+    rm -rf "$INSTALL_DIR"
+    log "卸载完成。"
+    exit 0
+}
 
-# 主菜单入口
+# --- 主循环 ---
+need_root
+init_setup
+
+# 核心检测：如果二进制文件或环境缺失，强制执行安装
+if [[ ! -f "$BIN_PATH" ]] || [[ ! -d "$GO_LOCAL_DIR" ]]; then
+    log "检测到环境不完整，正在初始化安装..."
+    ensure_go
+    build_app
+    sleep 1
+fi
+
 while true; do
     clear
     echo "============================="
     echo "    GH-PROXY 交互管理工具"
     echo "============================="
     echo " 1. 新建用户"
-    echo " 2. 用户管理"
-    echo " 3. 重新编译程序"
-    echo " 4. 查看使用说明"
+    echo " 2. 用户管理 (修改/删除)"
+    echo " 3. 强制重新编译程序"
+    echo " 4. 查看使用说明 (Help)"
     echo " 5. 卸载脚本"
-    echo " 0. 退出菜单"
+    echo " 0. 退出脚本"
     echo "============================="
-    read -p "选择: " choice
+    read -p "请输入选项 [0-5]: " choice
     case $choice in
         1) add_user ;;
         2) manage_users ;;
