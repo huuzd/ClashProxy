@@ -78,9 +78,9 @@ while true; do
     echo "    GH-PROXY 交互管理工具"
     echo "============================="
     echo " 1. 新建用户"
-    echo " 2. 修改/删除用户"
-    echo " 3. 查看使用说明 (Help)"
-    echo " 4. 强制重新编译程序"
+    echo " 2. 修改用户"
+    echo " 3. 使用说明"
+    echo " 4. 重新安装"
     echo " 5. 卸载脚本"
     echo " 0. 退出脚本"
     echo "============================="
@@ -111,13 +111,13 @@ while true; do
             clear
             ip=$(curl -s -m 5 https://api64.ipify.org || echo "服务器IP")
             echo "使用说明："
-            echo "1. 链接格式: http://用户名:密码@${ip}:${PORT}/raw/owner/repo/branch/file"
+            echo "1. 链接格式: http://用户名:密码@${ip}:${PORT}/raw/ 替换raw链接中的 https://raw.githubusercontent.com/ 部分"
             echo "2. 快捷管理: 以后直接输入 gh-proxy 命令即可再次进入此菜单"
-            echo "3. 安全建议: 建议使用 Nginx 反代 http://127.0.0.1:${PORT}"
+            echo "3. 安全建议: 建议使用 Nginx 反代并开启HTTPS"
             read -p "按回车返回..."
             ;;
         4)
-            echo "强制重新编译..."
+            echo "重新编译..."
             "${GO_LOCAL_DIR}/bin/go" build -trimpath -ldflags='-s -w' -o "$BIN_PATH" "$SRC_FILE"
             systemctl restart "$APP_NAME" && echo "编译完成并重启"
             sleep 1
