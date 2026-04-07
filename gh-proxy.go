@@ -22,7 +22,6 @@ var proxyClient = &http.Client{
 	},
 }
 
-// 校验用户信息
 func checkAuth(user, pass string) bool {
 	f, err := os.Open(".users")
 	if err != nil { return false }
@@ -45,7 +44,6 @@ func main() {
 	if port == "" { port = "9090" }
 
 	http.HandleFunc("/raw/", func(w http.ResponseWriter, r *http.Request) {
-		// 1. 身份校验
 		u, p, ok := r.BasicAuth()
 		if !ok || !checkAuth(u, p) {
 			w.Header().Set("WWW-Authenticate", `Basic realm="gh-proxy"`)
@@ -53,7 +51,6 @@ func main() {
 			return
 		}
 
-		// 2. 路径解析
 		cleanPath := path.Clean(r.URL.Path)
 		trimmed := strings.TrimPrefix(cleanPath, "/raw")
 		parts := strings.Split(strings.Trim(trimmed, "/"), "/")
@@ -62,7 +59,6 @@ func main() {
 			return
 		}
 
-		// 3. 构建目标 URL
 		upstream := &url.URL{
 			Scheme: "https",
 			Host:   "raw.githubusercontent.com",
@@ -76,7 +72,6 @@ func main() {
 		req, _ := http.NewRequestWithContext(ctx, r.Method, upstream.String(), nil)
 		req.Header.Set("User-Agent", "Mozilla/5.0 (GH-Proxy/2.0)")
 
-		// 4. 代理转发
 		resp, err := proxyClient.Do(req)
 		if err != nil {
 			http.Error(w, "Proxy Error", http.StatusBadGateway)
@@ -84,7 +79,6 @@ func main() {
 		}
 		defer resp.Body.Close()
 
-		// 复制 Header 并返回
 		for k, vv := range resp.Header {
 			for _, v := range vv { w.Header().Add(k, v) }
 		}
