@@ -17,23 +17,25 @@ import (
 )
 
 const (
-	userFile     = ".users"
-	defaultPort  = "9090"
-	defaultHost  = "127.0.0.1"
-	serverName   = "GH-Proxy/2.1"
-	upstreamHost = "raw.githubusercontent.com"
+	userFile            = ".users"
+	defaultPort         = "9090"
+	defaultHost         = "127.0.0.1"
+	serverName          = "GH-Proxy/2.2"
+	rawUpstreamHost     = "raw.githubusercontent.com"
+	releaseUpstreamHost = "github.com"
 )
 
 var proxyClient = &http.Client{
-	Timeout: 60 * time.Second,
+	Timeout: 10 * time.Minute,
 	Transport: &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		MaxIdleConns:          50,
 		MaxIdleConnsPerHost:   20,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		DisableCompression:    true,
 	},
 }
 
@@ -104,97 +106,133 @@ func copyResponseHeaders(dst, src http.Header) {
 	}
 }
 
-func buildUpstreamURL(rawPath, rawQuery string) (*url.URL, error) {
+func splitProxyPath(rawPath, prefix string) []string {
 	cleanPath := path.Clean(rawPath)
-	trimmed := strings.TrimPrefix(cleanPath, "/raw")
-	parts := strings.Split(strings.Trim(trimmed, "/"), "/")
+	trimmed := strings.TrimPrefix(cleanPath, prefix)
+	return strings.Split(strings.Trim(trimmed, "/"), "/")
+}
+
+func buildRawUpstreamURL(rawPath, rawQuery string) (*url.URL, error) {
+	parts := splitProxyPath(rawPath, "/raw")
 
 	// 格式要求：
 	// /raw/{owner}/{repo}/{branch}/{file...}
 	if len(parts) < 4 {
-		return nil, errors.New("invalid path format")
+		return nil, errors.New("invalid raw path format")
 	}
 
 	upstream := &url.URL{
 		Scheme:   "https",
-		Host:     upstreamHost,
+		Host:     rawUpstreamHost,
 		Path:     path.Join("/", parts[0], parts[1], parts[2], strings.Join(parts[3:], "/")),
 		RawQuery: rawQuery,
 	}
 	return upstream, nil
 }
 
-func proxyRawHandler(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
+func buildReleaseUpstreamURL(rawPath, rawQuery string) (*url.URL, error) {
+	parts := splitProxyPath(rawPath, "/release")
 
-	if !isAllowedMethod(r.Method) {
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
-		log.Printf("method rejected: remote=%s method=%s path=%s", r.RemoteAddr, r.Method, r.URL.Path)
-		return
+	// 格式要求：
+	// /release/{owner}/{repo}/{tag}/{asset-file...}
+	// 对应上游：
+	// https://github.com/{owner}/{repo}/releases/download/{tag}/{asset-file...}
+	if len(parts) < 4 {
+		return nil, errors.New("invalid release path format")
 	}
 
-	user, pass, ok := r.BasicAuth()
-	if !ok || !checkAuth(user, pass) {
-		unauthorized(w)
-		log.Printf("auth failed: remote=%s method=%s path=%s", r.RemoteAddr, r.Method, r.URL.Path)
-		return
+	upstream := &url.URL{
+		Scheme:   "https",
+		Host:     releaseUpstreamHost,
+		Path:     path.Join("/", parts[0], parts[1], "releases", "download", parts[2], strings.Join(parts[3:], "/")),
+		RawQuery: rawQuery,
 	}
+	return upstream, nil
+}
 
-	upstream, err := buildUpstreamURL(r.URL.Path, r.URL.RawQuery)
-	if err != nil {
-		http.Error(w, "Invalid Path Format", http.StatusBadRequest)
-		log.Printf("bad path: remote=%s user=%s path=%s err=%v", r.RemoteAddr, user, r.URL.Path, err)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 55*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, r.Method, upstream.String(), nil)
-	if err != nil {
-		http.Error(w, "Bad Request", http.StatusBadRequest)
-		log.Printf("build upstream request failed: user=%s upstream=%s err=%v", user, upstream.String(), err)
-		return
-	}
-
+func setForwardHeaders(req *http.Request, r *http.Request) {
 	req.Header.Set("User-Agent", "Mozilla/5.0 ("+serverName+")")
+	req.Header.Set("Accept", "application/octet-stream,*/*")
 
-	// 保留部分常见有用请求头
-	if v := r.Header.Get("Range"); v != "" {
-		req.Header.Set("Range", v)
-	}
-	if v := r.Header.Get("If-None-Match"); v != "" {
-		req.Header.Set("If-None-Match", v)
-	}
-	if v := r.Header.Get("If-Modified-Since"); v != "" {
-		req.Header.Set("If-Modified-Since", v)
+	// 保留下载、缓存、断点续传相关请求头
+	forwardHeaders := []string{
+		"Range",
+		"If-Range",
+		"If-None-Match",
+		"If-Modified-Since",
 	}
 
-	resp, err := proxyClient.Do(req)
-	if err != nil {
-		http.Error(w, "Proxy Error", http.StatusBadGateway)
-		log.Printf("proxy failed: user=%s upstream=%s err=%v", user, upstream.String(), err)
-		return
+	for _, h := range forwardHeaders {
+		if v := r.Header.Get(h); v != "" {
+			req.Header.Set(h, v)
+		}
 	}
-	defer resp.Body.Close()
+}
 
-	copyResponseHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
+func proxyHandler(buildUpstream func(string, string) (*url.URL, error)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
 
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		log.Printf("copy response failed: user=%s upstream=%s err=%v", user, upstream.String(), err)
+		if !isAllowedMethod(r.Method) {
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			log.Printf("method rejected: remote=%s method=%s path=%s", r.RemoteAddr, r.Method, r.URL.Path)
+			return
+		}
+
+		user, pass, ok := r.BasicAuth()
+		if !ok || !checkAuth(user, pass) {
+			unauthorized(w)
+			log.Printf("auth failed: remote=%s method=%s path=%s", r.RemoteAddr, r.Method, r.URL.Path)
+			return
+		}
+
+		upstream, err := buildUpstream(r.URL.Path, r.URL.RawQuery)
+		if err != nil {
+			http.Error(w, "Invalid Path Format", http.StatusBadRequest)
+			log.Printf("bad path: remote=%s user=%s path=%s err=%v", r.RemoteAddr, user, r.URL.Path, err)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(ctx, r.Method, upstream.String(), nil)
+		if err != nil {
+			http.Error(w, "Bad Request", http.StatusBadRequest)
+			log.Printf("build upstream request failed: user=%s upstream=%s err=%v", user, upstream.String(), err)
+			return
+		}
+
+		setForwardHeaders(req, r)
+
+		resp, err := proxyClient.Do(req)
+		if err != nil {
+			http.Error(w, "Proxy Error", http.StatusBadGateway)
+			log.Printf("proxy failed: user=%s upstream=%s err=%v", user, upstream.String(), err)
+			return
+		}
+		defer resp.Body.Close()
+
+		copyResponseHeaders(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+
+		if r.Method != http.MethodHead {
+			if _, err := io.Copy(w, resp.Body); err != nil {
+				log.Printf("copy response failed: user=%s upstream=%s err=%v", user, upstream.String(), err)
+			}
+		}
+
+		log.Printf(
+			"ok: remote=%s user=%s method=%s path=%s upstream=%s status=%d cost=%s",
+			r.RemoteAddr,
+			user,
+			r.Method,
+			r.URL.Path,
+			upstream.String(),
+			resp.StatusCode,
+			time.Since(start).Round(time.Millisecond),
+		)
 	}
-
-	log.Printf(
-		"ok: remote=%s user=%s method=%s path=%s upstream=%s status=%d cost=%s",
-		r.RemoteAddr,
-		user,
-		r.Method,
-		r.URL.Path,
-		upstream.String(),
-		resp.StatusCode,
-		time.Since(start).Round(time.Millisecond),
-	)
 }
 
 func main() {
@@ -209,7 +247,8 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/raw/", proxyRawHandler)
+	mux.HandleFunc("/raw/", proxyHandler(buildRawUpstreamURL))
+	mux.HandleFunc("/release/", proxyHandler(buildReleaseUpstreamURL))
 
 	addr := net.JoinHostPort(host, port)
 	server := &http.Server{
@@ -219,5 +258,7 @@ func main() {
 	}
 
 	log.Printf("Proxy Service running on http://%s", addr)
+	log.Printf("Raw proxy path: /raw/{owner}/{repo}/{branch}/{file...}")
+	log.Printf("Release proxy path: /release/{owner}/{repo}/{tag}/{asset-file...}")
 	log.Fatal(server.ListenAndServe())
 }
