@@ -155,18 +155,27 @@ initial_install() {
 show_usage() {
     clear
     echo "使用说明："
-    echo "1. 链接格式："
+    echo
+    echo "1. raw.githubusercontent.com 文件代理："
+    echo "   原始链接："
+    echo "   https://raw.githubusercontent.com/owner/repo/branch/file"
+    echo "   代理链接："
     echo "   https://用户名:密码@你的域名/raw/owner/repo/branch/file"
     echo
-    echo "2. 使用方式："
-    echo "   将原始 raw.githubusercontent.com 链接中的"
-    echo "   https://raw.githubusercontent.com/"
-    echo "   替换为"
-    echo "   https://用户名:密码@你的域名/raw/"
+    echo "2. GitHub Release 下载代理："
+    echo "   原始链接："
+    echo "   https://github.com/owner/repo/releases/download/tag/file"
+    echo "   代理链接："
+    echo "   https://用户名:密码@你的域名/release/owner/repo/tag/file"
     echo
-    echo "3. 说明："
+    echo "3. 示例："
+    echo "   https://用户名:密码@你的域名/release/cli/cli/v2.65.0/gh_2.65.0_linux_amd64.tar.gz"
+    echo
+    echo "4. 说明："
     echo "   - 当前程序默认仅监听 ${LISTEN_HOST}:${PORT}"
     echo "   - 请通过你自己的 Nginx / Caddy 反代访问"
+    echo "   - Release 下载会由本服务跟随 GitHub 跳转后再转发给客户端"
+    echo "   - 支持 GET / HEAD，并保留 Range 请求头，适合断点续传"
     echo "   - 若你修改了 .env 中的端口或监听地址，请重启服务"
     echo
     pause
