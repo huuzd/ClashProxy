@@ -17,13 +17,13 @@ import (
 )
 
 const (
-	userFile     = ".users"
-	defaultPort  = "9090"
-	defaultHost  = "127.0.0.1"
-	serverName   = "GH-Proxy/2.2"
+	userFile    = ".users"
+	defaultPort = "9090"
+	defaultHost = "127.0.0.1"
+	serverName  = "GH-Proxy/2.2"
 
-	rawHost      = "raw.githubusercontent.com"
-	githubHost   = "github.com"
+	rawHost    = "raw.githubusercontent.com"
+	githubHost = "github.com"
 )
 
 var proxyClient = &http.Client{
@@ -100,6 +100,7 @@ func copyResponseHeaders(dst, src http.Header) {
 		if _, blocked := hopByHop[http.CanonicalHeaderKey(k)]; blocked {
 			continue
 		}
+
 		for _, v := range vv {
 			dst.Add(k, v)
 		}
@@ -114,16 +115,25 @@ func buildRawUpstreamURL(rawPath, rawQuery string) (*url.URL, error) {
 	// 代理格式：
 	// /raw/{owner}/{repo}/{branch}/{file...}
 	//
-	// 原始格式：
+	// 上游格式：
 	// https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{file...}
 	if len(parts) < 4 {
 		return nil, errors.New("invalid raw path format")
 	}
 
+	owner := parts[0]
+	repo := parts[1]
+	branch := parts[2]
+	filePath := strings.Join(parts[3:], "/")
+
+	if owner == "" || repo == "" || branch == "" || filePath == "" {
+		return nil, errors.New("invalid raw path")
+	}
+
 	upstream := &url.URL{
 		Scheme:   "https",
 		Host:     rawHost,
-		Path:     path.Join("/", parts[0], parts[1], parts[2], strings.Join(parts[3:], "/")),
+		Path:     "/" + owner + "/" + repo + "/" + branch + "/" + filePath,
 		RawQuery: rawQuery,
 	}
 
@@ -137,7 +147,7 @@ func buildReleaseUpstreamURL(rawPath, rawQuery string) (*url.URL, error) {
 	// 代理格式：
 	// /{owner}/{repo}/releases/download/{tag}/{file...}
 	//
-	// 原始格式：
+	// 上游格式：
 	// https://github.com/{owner}/{repo}/releases/download/{tag}/{file...}
 	if len(parts) < 6 {
 		return nil, errors.New("invalid release path format")
@@ -159,7 +169,7 @@ func buildReleaseUpstreamURL(rawPath, rawQuery string) (*url.URL, error) {
 	upstream := &url.URL{
 		Scheme:   "https",
 		Host:     githubHost,
-		Path:     path.Join("/", owner, repo, "releases", "download", tag, filePath),
+		Path:     "/" + owner + "/" + repo + "/releases/download/" + tag + "/" + filePath,
 		RawQuery: rawQuery,
 	}
 
