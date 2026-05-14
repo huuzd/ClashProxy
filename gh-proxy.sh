@@ -3,8 +3,6 @@ set -euo pipefail
 
 # --- 1. 配置参数 ---
 APP_NAME="gh-proxy"
-GH_REPO="huuzd/gh-proxy"
-
 INSTALL_DIR="/opt/github-proxy"
 BIN_PATH="${INSTALL_DIR}/${APP_NAME}"
 SRC_FILE="${INSTALL_DIR}/${APP_NAME}.go"
@@ -55,22 +53,347 @@ user_exists() {
     awk -F: -v user="$u" '$1==user{found=1} END{exit !found}' "$USER_FILE"
 }
 
-download_source() {
-    echo "[gh-proxy] 从 GitHub 同步远程源码..."
-    echo "[gh-proxy] 仓库: ${GH_REPO}"
-    echo "[gh-proxy] 地址: https://raw.githubusercontent.com/${GH_REPO}/main/gh-proxy.go"
+write_source() {
+    echo "[gh-proxy] 写入内置最新版源码..."
+    cat > "$SRC_FILE" <<'GOEOF'
+package main
 
-    wget -qO "$SRC_FILE" "https://raw.githubusercontent.com/${GH_REPO}/main/gh-proxy.go" || {
-        echo "下载源码失败"
-        exit 1
-    }
+import (
+	"bufio"
+	"context"
+	"crypto/subtle"
+	"errors"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path"
+	"strings"
+	"time"
+)
 
+const (
+	userFile            = ".users"
+	defaultPort         = "9090"
+	defaultHost         = "127.0.0.1"
+	serverName          = "GH-Proxy/2.3"
+	rawUpstreamHost     = "raw.githubusercontent.com"
+	releaseUpstreamHost = "github.com"
+)
+
+var proxyClient = &http.Client{
+	Timeout: 10 * time.Minute,
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		MaxIdleConns:          50,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		DisableCompression:    true,
+	},
+}
+
+func checkAuth(user, pass string) bool {
+	f, err := os.Open(userFile)
+	if err != nil {
+		log.Printf("open %s failed: %v", userFile, err)
+		return false
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		fileUser := strings.TrimSpace(parts[0])
+		filePass := parts[1]
+
+		if subtle.ConstantTimeCompare([]byte(user), []byte(fileUser)) == 1 &&
+			subtle.ConstantTimeCompare([]byte(pass), []byte(filePass)) == 1 {
+			return true
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		log.Printf("scan %s failed: %v", userFile, err)
+	}
+
+	return false
+}
+
+func unauthorized(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", `Basic realm="gh-proxy"`)
+	http.Error(w, "Unauthorized", http.StatusUnauthorized)
+}
+
+func isAllowedMethod(method string) bool {
+	return method == http.MethodGet || method == http.MethodHead
+}
+
+func copyResponseHeaders(dst, src http.Header) {
+	hopByHop := map[string]struct{}{
+		"Connection":          {},
+		"Keep-Alive":          {},
+		"Proxy-Authenticate":  {},
+		"Proxy-Authorization": {},
+		"TE":                  {},
+		"Trailer":             {},
+		"Transfer-Encoding":   {},
+		"Upgrade":             {},
+	}
+
+	for k, vv := range src {
+		if _, blocked := hopByHop[http.CanonicalHeaderKey(k)]; blocked {
+			continue
+		}
+		for _, v := range vv {
+			dst.Add(k, v)
+		}
+	}
+}
+
+func splitProxyPath(rawPath, prefix string) []string {
+	cleanPath := path.Clean("/" + strings.TrimPrefix(rawPath, "/"))
+	trimmed := strings.TrimPrefix(cleanPath, prefix)
+	trimmed = strings.Trim(trimmed, "/")
+	if trimmed == "" {
+		return nil
+	}
+	return strings.Split(trimmed, "/")
+}
+
+func buildRawUpstreamURL(rawPath, rawQuery string) (*url.URL, error) {
+	parts := splitProxyPath(rawPath, "/raw")
+
+	// 代理格式：
+	// /raw/{owner}/{repo}/{branch}/{file...}
+	// 上游格式：
+	// https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{file...}
+	if len(parts) < 4 {
+		return nil, errors.New("invalid raw path format")
+	}
+
+	upstream := &url.URL{
+		Scheme:   "https",
+		Host:     rawUpstreamHost,
+		Path:     path.Join("/", parts[0], parts[1], parts[2], strings.Join(parts[3:], "/")),
+		RawQuery: rawQuery,
+	}
+	return upstream, nil
+}
+
+func buildReleaseUpstreamURL(rawPath, rawQuery string) (*url.URL, error) {
+	parts := splitProxyPath(rawPath, "/release")
+
+	// 代理格式 1：
+	// /release/{owner}/{repo}/{tag}/{asset-file...}
+	// 上游格式：
+	// https://github.com/{owner}/{repo}/releases/download/{tag}/{asset-file...}
+	//
+	// 代理格式 2：
+	// /release/{owner}/{repo}/latest/{asset-file...}
+	// 上游格式：
+	// https://github.com/{owner}/{repo}/releases/latest/download/{asset-file...}
+	if len(parts) < 4 {
+		return nil, errors.New("invalid release path format")
+	}
+
+	owner := parts[0]
+	repo := parts[1]
+	tag := parts[2]
+	asset := strings.Join(parts[3:], "/")
+
+	var upstreamPath string
+	if tag == "latest" {
+		upstreamPath = path.Join("/", owner, repo, "releases", "latest", "download", asset)
+	} else {
+		upstreamPath = path.Join("/", owner, repo, "releases", "download", tag, asset)
+	}
+
+	upstream := &url.URL{
+		Scheme:   "https",
+		Host:     releaseUpstreamHost,
+		Path:     upstreamPath,
+		RawQuery: rawQuery,
+	}
+	return upstream, nil
+}
+
+func buildGithubLikeUpstreamURL(rawPath, rawQuery string) (*url.URL, error) {
+	cleanPath := path.Clean("/" + strings.TrimPrefix(rawPath, "/"))
+	parts := strings.Split(strings.Trim(cleanPath, "/"), "/")
+
+	// 支持你希望的这种格式：
+	// /{owner}/{repo}/releases/latest/download/{asset-file...}
+	// 对应上游：
+	// https://github.com/{owner}/{repo}/releases/latest/download/{asset-file...}
+	//
+	// 同时支持普通 release：
+	// /{owner}/{repo}/releases/download/{tag}/{asset-file...}
+	// 对应上游：
+	// https://github.com/{owner}/{repo}/releases/download/{tag}/{asset-file...}
+	if len(parts) < 6 {
+		return nil, errors.New("invalid github-like release path format")
+	}
+
+	if parts[2] != "releases" {
+		return nil, errors.New("only github release path is allowed")
+	}
+
+	if parts[3] == "latest" {
+		if len(parts) < 6 || parts[4] != "download" {
+			return nil, errors.New("invalid latest release path format")
+		}
+	} else if parts[3] == "download" {
+		if len(parts) < 6 {
+			return nil, errors.New("invalid tagged release path format")
+		}
+	} else {
+		return nil, errors.New("only releases/latest/download or releases/download paths are allowed")
+	}
+
+	upstream := &url.URL{
+		Scheme:   "https",
+		Host:     releaseUpstreamHost,
+		Path:     cleanPath,
+		RawQuery: rawQuery,
+	}
+	return upstream, nil
+}
+
+func setForwardHeaders(req *http.Request, r *http.Request) {
+	req.Header.Set("User-Agent", "Mozilla/5.0 ("+serverName+")")
+	req.Header.Set("Accept", "application/octet-stream,*/*")
+
+	// 保留下载、缓存、断点续传相关请求头
+	forwardHeaders := []string{
+		"Range",
+		"If-Range",
+		"If-None-Match",
+		"If-Modified-Since",
+	}
+
+	for _, h := range forwardHeaders {
+		if v := r.Header.Get(h); v != "" {
+			req.Header.Set(h, v)
+		}
+	}
+}
+
+func proxyHandler(buildUpstream func(string, string) (*url.URL, error)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+
+		if !isAllowedMethod(r.Method) {
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			log.Printf("method rejected: remote=%s method=%s path=%s", r.RemoteAddr, r.Method, r.URL.Path)
+			return
+		}
+
+		user, pass, ok := r.BasicAuth()
+		if !ok || !checkAuth(user, pass) {
+			unauthorized(w)
+			log.Printf("auth failed: remote=%s method=%s path=%s", r.RemoteAddr, r.Method, r.URL.Path)
+			return
+		}
+
+		upstream, err := buildUpstream(r.URL.Path, r.URL.RawQuery)
+		if err != nil {
+			http.Error(w, "Invalid Path Format", http.StatusBadRequest)
+			log.Printf("bad path: remote=%s user=%s path=%s err=%v", r.RemoteAddr, user, r.URL.Path, err)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(ctx, r.Method, upstream.String(), nil)
+		if err != nil {
+			http.Error(w, "Bad Request", http.StatusBadRequest)
+			log.Printf("build upstream request failed: user=%s upstream=%s err=%v", user, upstream.String(), err)
+			return
+		}
+
+		setForwardHeaders(req, r)
+
+		resp, err := proxyClient.Do(req)
+		if err != nil {
+			http.Error(w, "Proxy Error", http.StatusBadGateway)
+			log.Printf("proxy failed: user=%s upstream=%s err=%v", user, upstream.String(), err)
+			return
+		}
+		defer resp.Body.Close()
+
+		copyResponseHeaders(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+
+		if r.Method != http.MethodHead {
+			if _, err := io.Copy(w, resp.Body); err != nil {
+				log.Printf("copy response failed: user=%s upstream=%s err=%v", user, upstream.String(), err)
+			}
+		}
+
+		log.Printf(
+			"ok: remote=%s user=%s method=%s path=%s upstream=%s status=%d cost=%s",
+			r.RemoteAddr,
+			user,
+			r.Method,
+			r.URL.Path,
+			upstream.String(),
+			resp.StatusCode,
+			time.Since(start).Round(time.Millisecond),
+		)
+	}
+}
+
+func main() {
+	port := strings.TrimSpace(os.Getenv("PORT"))
+	if port == "" {
+		port = defaultPort
+	}
+
+	host := strings.TrimSpace(os.Getenv("LISTEN_HOST"))
+	if host == "" {
+		host = defaultHost
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/raw/", proxyHandler(buildRawUpstreamURL))
+	mux.HandleFunc("/release/", proxyHandler(buildReleaseUpstreamURL))
+	mux.HandleFunc("/", proxyHandler(buildGithubLikeUpstreamURL))
+
+	addr := net.JoinHostPort(host, port)
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	log.Printf("Proxy Service running on http://%s", addr)
+	log.Printf("Raw proxy path: /raw/{owner}/{repo}/{branch}/{file...}")
+	log.Printf("Release proxy path: /release/{owner}/{repo}/{tag-or-latest}/{asset-file...}")
+	log.Printf("GitHub-like latest release path: /{owner}/{repo}/releases/latest/download/{asset-file...}")
+	log.Printf("GitHub-like tagged release path: /{owner}/{repo}/releases/download/{tag}/{asset-file...}")
+	log.Fatal(server.ListenAndServe())
+}
+GOEOF
     chmod 644 "$SRC_FILE"
 }
 
 install_go_local() {
-    echo "[gh-proxy] 准备 Go 编译环境..."
-
+    echo "[gh-proxy] 准备编译环境..."
     local arch="amd64"
     case "$(uname -m)" in
         x86_64|amd64) arch="amd64" ;;
@@ -82,24 +405,22 @@ install_go_local() {
     esac
 
     rm -rf "$GO_LOCAL_DIR"
-
     wget -qO- "https://go.dev/dl/go${GO_VERSION}.linux-${arch}.tar.gz" | tar -C "$INSTALL_DIR" -xz
 }
 
 build_binary() {
     [[ -x "${GO_LOCAL_DIR}/bin/go" ]] || {
-        echo "Go 编译环境不存在，请先安装或重装 Go 编译环境"
+        echo "Go 编译环境不存在，请先安装"
         exit 1
     }
 
     [[ -f "$SRC_FILE" ]] || {
-        echo "源码不存在，正在同步源码..."
-        download_source
+        echo "源码不存在，正在重新写入源码"
+        write_source
     }
 
     echo "[gh-proxy] 正在编译二进制文件..."
     "${GO_LOCAL_DIR}/bin/go" build -trimpath -ldflags='-s -w' -o "$BIN_PATH" "$SRC_FILE"
-
     chmod 755 "$BIN_PATH"
 }
 
@@ -134,24 +455,19 @@ EOF
 }
 
 install_global_command() {
-    local target="${INSTALL_DIR}/${APP_NAME}.sh"
-
-    if [[ "$(readlink -f "$0")" != "$(readlink -f "$target" 2>/dev/null || true)" ]]; then
-        cp "$0" "$target"
-    fi
-
-    chmod 755 "$target"
-    ln -sf "$target" "/usr/local/bin/${APP_NAME}"
+    cp "$0" "${INSTALL_DIR}/${APP_NAME}.sh"
+    chmod 755 "${INSTALL_DIR}/${APP_NAME}.sh"
+    ln -sf "${INSTALL_DIR}/${APP_NAME}.sh" "/usr/local/bin/${APP_NAME}"
 }
 
 initial_install() {
-    echo "[gh-proxy] 检测到未完整安装，开始初始化..."
+    echo "[gh-proxy] 检测到未安装，开始初始化..."
 
     require_cmd wget
     require_cmd tar
     require_cmd systemctl
 
-    download_source
+    write_source
     install_go_local
     build_binary
     write_service
@@ -163,35 +479,48 @@ initial_install() {
     fi
 
     echo "[gh-proxy] 安装成功！已生成全局命令: ${APP_NAME}"
-    sleep 1
 }
 
 show_usage() {
     clear
     echo "使用说明："
     echo
-    echo "1. Raw 文件代理："
+    echo "1. raw.githubusercontent.com 文件代理："
     echo "   原始链接："
     echo "   https://raw.githubusercontent.com/owner/repo/branch/file"
-    echo
     echo "   代理链接："
     echo "   https://用户名:密码@你的域名/raw/owner/repo/branch/file"
     echo
-    echo "2. GitHub Release 下载代理："
+    echo "2. GitHub Release 下载代理，兼容旧格式："
     echo "   原始链接："
     echo "   https://github.com/owner/repo/releases/download/tag/file"
+    echo "   代理链接："
+    echo "   https://用户名:密码@你的域名/release/owner/repo/tag/file"
     echo
+    echo "3. GitHub Release latest 下载代理，兼容旧入口："
+    echo "   原始链接："
+    echo "   https://github.com/owner/repo/releases/latest/download/file"
+    echo "   代理链接："
+    echo "   https://用户名:密码@你的域名/release/owner/repo/latest/file"
+    echo
+    echo "4. GitHub Release latest 下载代理，GitHub 原路径镜像格式："
+    echo "   原始链接："
+    echo "   https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
+    echo "   代理链接："
+    echo "   https://用户名:密码@你的域名/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
+    echo
+    echo "5. GitHub Release 普通 tag 下载代理，GitHub 原路径镜像格式："
+    echo "   原始链接："
+    echo "   https://github.com/owner/repo/releases/download/tag/file"
     echo "   代理链接："
     echo "   https://用户名:密码@你的域名/owner/repo/releases/download/tag/file"
     echo
-    echo "3. Release 示例："
-    echo "   https://用户名:密码@你的域名/cli/cli/releases/download/v2.65.0/gh_2.65.0_linux_amd64.tar.gz"
-    echo
-    echo "4. 说明："
+    echo "6. 说明："
     echo "   - 当前程序默认仅监听 ${LISTEN_HOST}:${PORT}"
     echo "   - 请通过你自己的 Nginx / Caddy 反代访问"
+    echo "   - Release 下载会由本服务跟随 GitHub 跳转后再转发给客户端"
+    echo "   - 支持 GET / HEAD，并保留 Range 请求头，适合断点续传"
     echo "   - 若你修改了 .env 中的端口或监听地址，请重启服务"
-    echo "   - 选项 5 会重新从 GitHub 拉取 ${GH_REPO}/main/gh-proxy.go"
     echo
     pause
 }
@@ -223,10 +552,7 @@ add_user() {
 
     echo "${u}:${p}" >> "$USER_FILE"
     chmod 600 "$USER_FILE"
-
-    if systemctl is-active --quiet "$APP_NAME"; then
-        systemctl restart "$APP_NAME"
-    fi
+    systemctl restart "$APP_NAME"
 
     echo "添加成功"
     pause
@@ -262,9 +588,6 @@ modify_user() {
 
     local target="${users[$((idx-1))]}"
     local opt
-
-    echo
-    echo "当前选择用户: $target"
     echo "1. 修改密码"
     echo "2. 删除用户"
     echo "0. 返回"
@@ -275,7 +598,6 @@ modify_user() {
             local p
             read -r -s -p "新密码: " p
             echo
-
             if [[ -z "$p" ]]; then
                 echo "密码不能为空"
                 pause
@@ -285,22 +607,14 @@ modify_user() {
             awk -F: -v user="$target" -v pass="$p" 'BEGIN{OFS=":"} $1==user{$2=pass} {print}' "$USER_FILE" > "${USER_FILE}.tmp"
             mv "${USER_FILE}.tmp" "$USER_FILE"
             chmod 600 "$USER_FILE"
-
-            if systemctl is-active --quiet "$APP_NAME"; then
-                systemctl restart "$APP_NAME"
-            fi
-
+            systemctl restart "$APP_NAME"
             echo "密码修改完成"
             ;;
         2)
             awk -F: -v user="$target" '$1!=user {print}' "$USER_FILE" > "${USER_FILE}.tmp"
             mv "${USER_FILE}.tmp" "$USER_FILE"
             chmod 600 "$USER_FILE"
-
-            if systemctl is-active --quiet "$APP_NAME"; then
-                systemctl restart "$APP_NAME"
-            fi
-
+            systemctl restart "$APP_NAME"
             echo "用户已删除"
             ;;
         0)
@@ -322,37 +636,12 @@ rebuild_local() {
     sleep 1
 }
 
-update_and_reinstall() {
-    echo "[gh-proxy] 更新远程源码并重新编译..."
-
-    require_cmd wget
-    require_cmd tar
-    require_cmd systemctl
-
-    download_source
-
-    if [[ ! -x "${GO_LOCAL_DIR}/bin/go" ]]; then
-        install_go_local
-    fi
-
-    build_binary
-    write_service
-    install_global_command
-    systemctl restart "$APP_NAME"
-
-    echo "更新完成并重启"
-    sleep 1
-}
-
-reinstall_go() {
-    require_cmd wget
-    require_cmd tar
-
-    install_go_local
+rewrite_source_and_rebuild() {
+    echo "[gh-proxy] 重写内置源码并重新编译..."
+    write_source
     build_binary
     systemctl restart "$APP_NAME"
-
-    echo "Go 编译环境已重装，程序已重新编译并重启"
+    echo "源码已重写，编译完成并重启"
     sleep 1
 }
 
@@ -363,83 +652,8 @@ show_service_status() {
     pause
 }
 
-show_logs() {
-    clear
-    journalctl -u "$APP_NAME" -n 80 --no-pager || true
-    echo
-    pause
-}
-
-show_config() {
-    clear
-    echo "安装目录: $INSTALL_DIR"
-    echo "二进制文件: $BIN_PATH"
-    echo "源码文件: $SRC_FILE"
-    echo "环境文件: $ENV_FILE"
-    echo "用户文件: $USER_FILE"
-    echo "systemd 文件: $SERVICE_FILE"
-    echo "远程源码仓库: $GH_REPO"
-    echo
-    echo ".env 内容："
-    echo "-----------------------------"
-    cat "$ENV_FILE" || true
-    echo "-----------------------------"
-    echo
-    echo "当前源码关键路由检查："
-    echo "-----------------------------"
-    grep -nE 'HandleFunc|releases/download|raw.githubusercontent.com|github.com' "$SRC_FILE" || true
-    echo "-----------------------------"
-    echo
-    echo "监听端口检查："
-    ss -lntp | grep "${PORT}" || true
-    echo
-    pause
-}
-
-edit_env() {
-    clear
-
-    local current_host current_port new_host new_port
-
-    current_host="$(grep -E '^LISTEN_HOST=' "$ENV_FILE" | cut -d= -f2- || true)"
-    current_port="$(grep -E '^PORT=' "$ENV_FILE" | cut -d= -f2- || true)"
-
-    current_host="${current_host:-$LISTEN_HOST}"
-    current_port="${current_port:-$PORT}"
-
-    echo "当前 .env："
-    echo "-----------------------------"
-    cat "$ENV_FILE" || true
-    echo "-----------------------------"
-    echo
-
-    read -r -p "监听地址 LISTEN_HOST [当前 ${current_host}，直接回车不改]: " new_host
-    read -r -p "端口 PORT [当前 ${current_port}，直接回车不改]: " new_port
-
-    new_host="${new_host:-$current_host}"
-    new_port="${new_port:-$current_port}"
-
-    if [[ ! "$new_port" =~ ^[0-9]+$ ]] || (( new_port < 1 || new_port > 65535 )); then
-        echo "端口不合法"
-        pause
-        return
-    fi
-
-    cat > "$ENV_FILE" <<EOF
-PORT=${new_port}
-LISTEN_HOST=${new_host}
-EOF
-    chmod 600 "$ENV_FILE"
-
-    systemctl restart "$APP_NAME"
-
-    echo "配置已保存并重启服务"
-    pause
-}
-
 uninstall_all() {
-    read -r -p "确定卸载吗？这会删除 ${INSTALL_DIR} 下的所有数据，包括用户文件。(y/N): " confirm
-
+    read -r -p "确定卸载吗？(y/N): " confirm
     if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
         return
     fi
@@ -455,8 +669,9 @@ uninstall_all() {
 }
 
 # --- 4. 首次安装逻辑 ---
-if [[ ! -x "$BIN_PATH" ]] || [[ ! -d "$GO_LOCAL_DIR" ]] || [[ ! -f "$SERVICE_FILE" ]] || [[ ! -f "$SRC_FILE" ]]; then
+if [[ ! -x "$BIN_PATH" ]] || [[ ! -d "$GO_LOCAL_DIR" ]] || [[ ! -f "$SERVICE_FILE" ]]; then
     initial_install
+    sleep 1
 fi
 
 # --- 5. 交互菜单 ---
@@ -466,32 +681,24 @@ while true; do
     echo "    GH-PROXY 交互管理工具"
     echo "============================="
     echo " 1. 新建用户"
-    echo " 2. 修改 / 删除用户"
+    echo " 2. 修改用户"
     echo " 3. 使用说明"
     echo " 4. 重新编译本地源码"
-    echo " 5. 更新远程源码并重编译"
+    echo " 5. 重写内置源码并重编译"
     echo " 6. 查看服务状态"
-    echo " 7. 查看服务日志"
-    echo " 8. 查看当前配置"
-    echo " 9. 修改监听地址 / 端口"
-    echo "10. 重装 Go 编译环境"
-    echo "11. 卸载脚本"
+    echo " 7. 卸载脚本"
     echo " 0. 退出脚本"
     echo "============================="
-    read -r -p "请输入选项 [0-11]: " choice
+    read -r -p "请输入选项 [0-7]: " choice
 
     case "${choice:-}" in
         1) add_user ;;
         2) modify_user ;;
         3) show_usage ;;
         4) rebuild_local ;;
-        5) update_and_reinstall ;;
+        5) rewrite_source_and_rebuild ;;
         6) show_service_status ;;
-        7) show_logs ;;
-        8) show_config ;;
-        9) edit_env ;;
-        10) reinstall_go ;;
-        11) uninstall_all ;;
+        7) uninstall_all ;;
         0) exit 0 ;;
         *) echo "无效选项"; sleep 1 ;;
     esac
