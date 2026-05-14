@@ -17,25 +17,25 @@ import (
 )
 
 const (
-	userFile    = ".users"
-	defaultPort = "9090"
-	defaultHost = "127.0.0.1"
-	serverName  = "GH-Proxy/2.2"
-
-	rawHost    = "raw.githubusercontent.com"
-	githubHost = "github.com"
+	userFile            = ".users"
+	defaultPort         = "9090"
+	defaultHost         = "127.0.0.1"
+	serverName          = "GH-Proxy/2.2"
+	rawUpstreamHost     = "raw.githubusercontent.com"
+	releaseUpstreamHost = "github.com"
 )
 
 var proxyClient = &http.Client{
-	Timeout: 60 * time.Second,
+	Timeout: 10 * time.Minute,
 	Transport: &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		MaxIdleConns:          50,
 		MaxIdleConnsPerHost:   20,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		DisableCompression:    true,
 	},
 }
 
@@ -100,83 +100,119 @@ func copyResponseHeaders(dst, src http.Header) {
 		if _, blocked := hopByHop[http.CanonicalHeaderKey(k)]; blocked {
 			continue
 		}
-
 		for _, v := range vv {
 			dst.Add(k, v)
 		}
 	}
 }
 
-func buildRawUpstreamURL(rawPath, rawQuery string) (*url.URL, error) {
+func splitProxyPath(rawPath, prefix string) []string {
 	cleanPath := path.Clean(rawPath)
-	trimmed := strings.TrimPrefix(cleanPath, "/raw")
-	parts := strings.Split(strings.Trim(trimmed, "/"), "/")
+	trimmed := strings.TrimPrefix(cleanPath, prefix)
+	return strings.Split(strings.Trim(trimmed, "/"), "/")
+}
 
-	// 代理格式：
+func buildRawUpstreamURL(rawPath, rawQuery string) (*url.URL, error) {
+	parts := splitProxyPath(rawPath, "/raw")
+
+	// 格式要求：
 	// /raw/{owner}/{repo}/{branch}/{file...}
-	//
-	// 上游格式：
-	// https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{file...}
 	if len(parts) < 4 {
 		return nil, errors.New("invalid raw path format")
 	}
 
-	owner := parts[0]
-	repo := parts[1]
-	branch := parts[2]
-	filePath := strings.Join(parts[3:], "/")
-
-	if owner == "" || repo == "" || branch == "" || filePath == "" {
-		return nil, errors.New("invalid raw path")
-	}
-
 	upstream := &url.URL{
 		Scheme:   "https",
-		Host:     rawHost,
-		Path:     "/" + owner + "/" + repo + "/" + branch + "/" + filePath,
+		Host:     rawUpstreamHost,
+		Path:     path.Join("/", parts[0], parts[1], parts[2], strings.Join(parts[3:], "/")),
 		RawQuery: rawQuery,
 	}
-
 	return upstream, nil
 }
 
 func buildReleaseUpstreamURL(rawPath, rawQuery string) (*url.URL, error) {
-	cleanPath := path.Clean(rawPath)
-	parts := strings.Split(strings.Trim(cleanPath, "/"), "/")
+	parts := splitProxyPath(rawPath, "/release")
 
-	// 代理格式：
-	// /{owner}/{repo}/releases/download/{tag}/{file...}
-	//
-	// 上游格式：
-	// https://github.com/{owner}/{repo}/releases/download/{tag}/{file...}
-	if len(parts) < 6 {
+	// 格式要求：
+	// /release/{owner}/{repo}/{tag}/{asset-file...}
+	// 对应上游：
+	// https://github.com/{owner}/{repo}/releases/download/{tag}/{asset-file...}
+	if len(parts) < 4 {
 		return nil, errors.New("invalid release path format")
-	}
-
-	if parts[2] != "releases" || parts[3] != "download" {
-		return nil, errors.New("not a github release download path")
-	}
-
-	owner := parts[0]
-	repo := parts[1]
-	tag := parts[4]
-	filePath := strings.Join(parts[5:], "/")
-
-	if owner == "" || repo == "" || tag == "" || filePath == "" {
-		return nil, errors.New("invalid release path")
 	}
 
 	upstream := &url.URL{
 		Scheme:   "https",
-		Host:     githubHost,
-		Path:     "/" + owner + "/" + repo + "/releases/download/" + tag + "/" + filePath,
+		Host:     releaseUpstreamHost,
+		Path:     path.Join("/", parts[0], parts[1], "releases", "download", parts[2], strings.Join(parts[3:], "/")),
 		RawQuery: rawQuery,
 	}
-
 	return upstream, nil
 }
 
-func proxyHandler(builder func(string, string) (*url.URL, error)) http.HandlerFunc {
+func buildGitHubReleaseMirrorUpstreamURL(rawPath, rawQuery string) (*url.URL, error) {
+	parts := splitProxyPath(rawPath, "/")
+
+	// 格式要求 1：
+	// /{owner}/{repo}/releases/latest/download/{asset-file...}
+	// 对应上游：
+	// https://github.com/{owner}/{repo}/releases/latest/download/{asset-file...}
+	//
+	// 格式要求 2：
+	// /{owner}/{repo}/releases/download/{tag}/{asset-file...}
+	// 对应上游：
+	// https://github.com/{owner}/{repo}/releases/download/{tag}/{asset-file...}
+	if len(parts) < 6 {
+		return nil, errors.New("invalid github release mirror path format")
+	}
+
+	owner := parts[0]
+	repo := parts[1]
+	if owner == "" || repo == "" || parts[2] != "releases" {
+		return nil, errors.New("invalid github release mirror path format")
+	}
+
+	var upstreamPath string
+	switch {
+	case parts[3] == "latest" && parts[4] == "download":
+		// /owner/repo/releases/latest/download/asset...
+		upstreamPath = path.Join("/", owner, repo, "releases", "latest", "download", strings.Join(parts[5:], "/"))
+	case parts[3] == "download" && len(parts) >= 6:
+		// /owner/repo/releases/download/tag/asset...
+		upstreamPath = path.Join("/", owner, repo, "releases", "download", parts[4], strings.Join(parts[5:], "/"))
+	default:
+		return nil, errors.New("invalid github release mirror path format")
+	}
+
+	upstream := &url.URL{
+		Scheme:   "https",
+		Host:     releaseUpstreamHost,
+		Path:     upstreamPath,
+		RawQuery: rawQuery,
+	}
+	return upstream, nil
+}
+
+func setForwardHeaders(req *http.Request, r *http.Request) {
+	req.Header.Set("User-Agent", "Mozilla/5.0 ("+serverName+")")
+	req.Header.Set("Accept", "application/octet-stream,*/*")
+
+	// 保留下载、缓存、断点续传相关请求头
+	forwardHeaders := []string{
+		"Range",
+		"If-Range",
+		"If-None-Match",
+		"If-Modified-Since",
+	}
+
+	for _, h := range forwardHeaders {
+		if v := r.Header.Get(h); v != "" {
+			req.Header.Set(h, v)
+		}
+	}
+}
+
+func proxyHandler(buildUpstream func(string, string) (*url.URL, error)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
@@ -193,14 +229,14 @@ func proxyHandler(builder func(string, string) (*url.URL, error)) http.HandlerFu
 			return
 		}
 
-		upstream, err := builder(r.URL.Path, r.URL.RawQuery)
+		upstream, err := buildUpstream(r.URL.Path, r.URL.RawQuery)
 		if err != nil {
 			http.Error(w, "Invalid Path Format", http.StatusBadRequest)
 			log.Printf("bad path: remote=%s user=%s path=%s err=%v", r.RemoteAddr, user, r.URL.Path, err)
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(r.Context(), 55*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
 		defer cancel()
 
 		req, err := http.NewRequestWithContext(ctx, r.Method, upstream.String(), nil)
@@ -210,21 +246,7 @@ func proxyHandler(builder func(string, string) (*url.URL, error)) http.HandlerFu
 			return
 		}
 
-		req.Header.Set("User-Agent", "Mozilla/5.0 ("+serverName+")")
-
-		// 保留断点续传和缓存相关请求头
-		if v := r.Header.Get("Range"); v != "" {
-			req.Header.Set("Range", v)
-		}
-		if v := r.Header.Get("If-Range"); v != "" {
-			req.Header.Set("If-Range", v)
-		}
-		if v := r.Header.Get("If-None-Match"); v != "" {
-			req.Header.Set("If-None-Match", v)
-		}
-		if v := r.Header.Get("If-Modified-Since"); v != "" {
-			req.Header.Set("If-Modified-Since", v)
-		}
+		setForwardHeaders(req, r)
 
 		resp, err := proxyClient.Do(req)
 		if err != nil {
@@ -237,8 +259,10 @@ func proxyHandler(builder func(string, string) (*url.URL, error)) http.HandlerFu
 		copyResponseHeaders(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
 
-		if _, err := io.Copy(w, resp.Body); err != nil {
-			log.Printf("copy response failed: user=%s upstream=%s err=%v", user, upstream.String(), err)
+		if r.Method != http.MethodHead {
+			if _, err := io.Copy(w, resp.Body); err != nil {
+				log.Printf("copy response failed: user=%s upstream=%s err=%v", user, upstream.String(), err)
+			}
 		}
 
 		log.Printf(
@@ -266,14 +290,9 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-
-	// Raw 文件代理：
-	// https://用户名:密码@你的域名/raw/owner/repo/branch/file
 	mux.HandleFunc("/raw/", proxyHandler(buildRawUpstreamURL))
-
-	// GitHub Release 下载代理：
-	// https://用户名:密码@你的域名/owner/repo/releases/download/tag/file
-	mux.HandleFunc("/", proxyHandler(buildReleaseUpstreamURL))
+	mux.HandleFunc("/release/", proxyHandler(buildReleaseUpstreamURL))
+	mux.HandleFunc("/", proxyHandler(buildGitHubReleaseMirrorUpstreamURL))
 
 	addr := net.JoinHostPort(host, port)
 	server := &http.Server{
@@ -283,5 +302,9 @@ func main() {
 	}
 
 	log.Printf("Proxy Service running on http://%s", addr)
+	log.Printf("Raw proxy path: /raw/{owner}/{repo}/{branch}/{file...}")
+	log.Printf("Release proxy path: /release/{owner}/{repo}/{tag}/{asset-file...}")
+	log.Printf("GitHub-like release mirror path: /{owner}/{repo}/releases/latest/download/{asset-file...}")
+	log.Printf("GitHub-like release mirror path: /{owner}/{repo}/releases/download/{tag}/{asset-file...}")
 	log.Fatal(server.ListenAndServe())
 }
